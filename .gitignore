@@ -1,0 +1,4 @@
+/note-cli
+/note-cli.exe
+dist/
+.note-cli.json
