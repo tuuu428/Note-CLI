@@ -90,7 +90,7 @@ func TestValidatePaid(t *testing.T) {
 }
 
 func TestToHTMLSplitsPaidSection(t *testing.T) {
-	h, err := ToHTML("# 見出し\n\n無料です\n\n<!-- paid -->\n\n有料です\n#### 小")
+	h, err := ToHTML("# 見出し\n\n無料です\n\n<!-- paid -->\n\n有料です\n#### 小", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestToHTMLSplitsPaidSection(t *testing.T) {
 }
 
 func TestToHTMLHardWraps(t *testing.T) {
-	h, err := ToHTML("一行目\n二行目")
+	h, err := ToHTML("一行目\n二行目", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,9 +118,45 @@ func TestToHTMLHardWraps(t *testing.T) {
 	}
 }
 
-func TestLocalImages(t *testing.T) {
-	got := LocalImages("![a](./img.png) ![b](https://example.com/x.png)")
-	if len(got) != 1 {
-		t.Errorf("ローカル画像だけを検出するべき: %v", got)
+func TestImages(t *testing.T) {
+	body := "前\n\n![猫の写真](./img/cat.png)\n\n文中の ![](dog.jpg) と ![](https://example.com/x.png)\n\n![](./img/cat.png)"
+	refs := ImageRefs(body)
+	if len(refs) != 2 || refs[0] != "./img/cat.png" || refs[1] != "dog.jpg" {
+		t.Fatalf("ローカル画像だけを重複なしで返すべき: %v", refs)
+	}
+
+	h, err := ToHTML(body, map[string]string{"./img/cat.png": "https://assets.example/cat.png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(h.Full, `<img src="https://assets.example/cat.png" alt="" width="620" height="auto"><figcaption>猫の写真</figcaption></figure>`) {
+		t.Errorf("画像だけの段落は note の figure になるべき: %s", h.Full)
+	}
+	if !strings.Contains(h.Full, `src="upload://dog.jpg"`) || !strings.Contains(h.Full, `src="https://example.com/x.png"`) {
+		t.Errorf("文中の画像: %s", h.Full)
+	}
+}
+
+func TestValidateImages(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "ok.png", "x")
+	write(t, dir, "doc.pdf", "x")
+	p := write(t, dir, "a.md", "---\ntitle: t\neyecatch: missing.png\n---\n![](ok.png)\n\n![](doc.pdf)\n\n![](%E7%84%A1.png)\n")
+	a, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = a.Validate()
+	if err == nil {
+		t.Fatal("エラーになるべき")
+	}
+	msg := err.Error()
+	for _, want := range []string{"missing.png が見つかりません", "doc.pdf は対応していない形式", "%E7%84%A1.png が見つかりません"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("%q が含まれていない: %s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "ok.png") {
+		t.Errorf("存在する画像はエラーにしない: %s", msg)
 	}
 }

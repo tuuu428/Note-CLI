@@ -1,6 +1,8 @@
 package note
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,6 +80,15 @@ type Posted struct {
 	Key    string `json:"key"`
 	Status string `json:"status"`
 	URL    string `json:"url"`
+
+	Images   map[string]string `json:"images,omitempty"`   // 画像の中身のハッシュ値 → アップロード後の URL
+	Eyecatch string            `json:"eyecatch,omitempty"` // 設定済みの見出し画像のハッシュ値
+}
+
+// Hash はファイルの中身から「指紋」（SHA-256）を作ります。中身が 1 バイトでも違えば別の値になります。
+func Hash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 type State map[string]Posted // キーはファイル名

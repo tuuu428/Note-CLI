@@ -1,0 +1,35 @@
+# 毎週 1 回、note の API が想定どおりか確認する（読み取りだけ・投稿はしない）
+# 失敗すると GitHub からメールが届くので、note の仕様変更に早めに気づける。
+#
+# 使うには: リポジトリの Settings → Secrets and variables → Actions で
+#   NOTE_SESSION に _note_session_v5 の値を登録する（未登録なら何もせず終了）
+# ※ この値はあなたのアカウントを操作できる鍵です。リポジトリを公開する場合は特に慎重に。
+name: API check
+
+on:
+  schedule:
+    - cron: "17 0 * * 1" # 毎週月曜 9:17（日本時間）
+  workflow_dispatch: # Actions 画面の「Run workflow」ボタンで手動実行もできる
+
+permissions:
+  contents: read
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: NOTE_SESSION が登録されているか
+        id: secret
+        run: echo "ok=${{ secrets.NOTE_SESSION != '' }}" >> "$GITHUB_OUTPUT"
+      - if: steps.secret.outputs.ok == 'true'
+        uses: actions/checkout@v4
+      - if: steps.secret.outputs.ok == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - if: steps.secret.outputs.ok == 'true'
+        run: go run . doctor
+        env:
+          NOTE_SESSION: ${{ secrets.NOTE_SESSION }}
+      - if: steps.secret.outputs.ok != 'true'
+        run: echo "NOTE_SESSION が未登録なのでスキップしました"

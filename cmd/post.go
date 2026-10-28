@@ -76,8 +76,11 @@ func init() {
 				return nil
 			}
 
-			for _, a := range arts {
+			for i, a := range arts {
 				if err := postOne(client, user, a); err != nil {
+					if rest := len(arts) - i - 1; rest > 0 {
+						fmt.Fprintf(os.Stderr, "※ エラーのため、残り %d 件は投稿していません\n", rest)
+					}
 					return fmt.Errorf("%s: %w", a.Path, err)
 				}
 			}
@@ -110,8 +113,8 @@ func init() {
 					continue
 				}
 				fmt.Printf("OK %s\n   「%s」 %s\n", f, a.Settings.Title, a.Settings.Visibility())
-				for _, img := range article.LocalImages(a.Body) {
-					fmt.Printf("   ⚠ ローカル画像は未対応です（投稿後に note で追加してください）: %s\n", img)
+				if refs := article.ImageRefs(a.Body); len(refs) > 0 {
+					fmt.Printf("   本文の画像 %d 枚: %s\n", len(refs), strings.Join(refs, ", "))
 				}
 			}
 			if ng > 0 {
@@ -175,11 +178,17 @@ func confirmPublish(arts []*article.Article) bool {
 
 func printDryRun(arts []*article.Article) error {
 	for _, a := range arts {
-		h, err := article.ToHTML(a.Body)
+		h, err := article.ToHTML(a.Body, nil)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("=== %s\n「%s」 %s\n", a.Path, a.Settings.Title, a.Settings.Visibility())
+		for _, ref := range article.ImageRefs(a.Body) {
+			fmt.Printf("画像をアップロード予定: %s（本文では upload://%s と表示）\n", ref, ref)
+		}
+		if a.Settings.Eyecatch != "" {
+			fmt.Printf("見出し画像をアップロード予定: %s\n", a.Settings.Eyecatch)
+		}
 		if a.Settings.Status == article.StatusPublished {
 			fmt.Println("公開 API に送る内容:")
 			enc := json.NewEncoder(os.Stdout)
@@ -201,46 +210,109 @@ func postOne(client *note.Client, user *note.User, a *article.Article) error {
 	if err != nil {
 		return err
 	}
-	h, err := article.ToHTML(a.Body)
-	if err != nil {
-		return err
-	}
 
 	rec, exists := state[name]
+	if exists && rec.Status == article.StatusPublished && a.Settings.Status == article.StatusDraft {
+		return fmt.Errorf("この記事は公開済みです。下書きに戻すことはできないので、note の画面で操作してください（%s）", note.EditURL(rec.Key))
+	}
 	if !exists {
 		n, err := client.CreateDraft(user.ID, a.Settings.Title)
 		if err != nil {
 			return err
 		}
 		rec = note.Posted{ID: n.ID, Key: n.Key, Status: article.StatusDraft}
-		// 作成できた時点で記録しておく（この後失敗しても、次回は同じ記事を更新できる）
+	}
+	// 記録はこまめに保存する（途中で失敗しても、次回は同じ記事・アップロード済み画像を再利用できる）
+	save := func() error {
 		state[name] = rec
-		if err := state.Save(dir); err != nil {
-			return err
-		}
+		return state.Save(dir)
+	}
+	if err := save(); err != nil {
+		return err
+	}
+
+	images, err := uploadImages(client, a, &rec, save)
+	if err != nil {
+		return err
+	}
+	h, err := article.ToHTML(a.Body, images)
+	if err != nil {
+		return err
+	}
+	if err := uploadEyecatch(client, a, &rec, save); err != nil {
+		return err
 	}
 
 	if a.Settings.Status == article.StatusPublished {
 		if err := client.Publish(rec.ID, note.PublishPayload(a, h)); err != nil {
 			return err
 		}
+		// 本当に公開・価格設定されたか、note から読み直して確認する
+		if err := client.Verify(rec.Key, note.Expectation{Status: article.StatusPublished, Price: a.Settings.PriceValue()}); err != nil {
+			return err
+		}
 		rec.Status = article.StatusPublished
 		rec.URL = note.NoteURL(user.URLName, rec.Key)
 		fmt.Printf("公開しました: 「%s」 %s\n", a.Settings.Title, rec.URL)
 	} else {
-		if rec.Status == article.StatusPublished {
-			return fmt.Errorf("この記事は公開済みです。下書きに戻すことはできないので、note の画面で操作してください（%s）", note.EditURL(rec.Key))
-		}
 		if err := client.SaveDraft(rec.ID, a.Settings.Title, h.Full, h.Length); err != nil {
 			return err
 		}
 		rec.URL = note.EditURL(rec.Key)
 		fmt.Printf("下書き保存しました: 「%s」 %s\n", a.Settings.Title, rec.URL)
 	}
-	for _, img := range article.LocalImages(a.Body) {
-		fmt.Printf("   ⚠ ローカル画像は未対応です（note の編集画面で追加してください）: %s\n", img)
-	}
+	return save()
+}
 
-	state[name] = rec
-	return state.Save(dir)
+// uploadImages は本文の画像をアップロードし、「本文に書いた場所 → note 上の URL」の対応表を返します。
+// 中身が同じ画像（ハッシュ値が同じ）は、前回アップロードした URL を使い回します。
+func uploadImages(client *note.Client, a *article.Article, rec *note.Posted, save func() error) (map[string]string, error) {
+	urls := map[string]string{}
+	for _, ref := range article.ImageRefs(a.Body) {
+		data, err := os.ReadFile(a.ImagePath(ref))
+		if err != nil {
+			return nil, err
+		}
+		hash := note.Hash(data)
+		if u, ok := rec.Images[hash]; ok {
+			urls[ref] = u
+			continue
+		}
+		fmt.Printf("   画像をアップロード中: %s\n", ref)
+		u, err := client.UploadImage(filepath.Base(a.ImagePath(ref)), data)
+		if err != nil {
+			return nil, err
+		}
+		if rec.Images == nil {
+			rec.Images = map[string]string{}
+		}
+		rec.Images[hash] = u
+		urls[ref] = u
+		if err := save(); err != nil {
+			return nil, err
+		}
+	}
+	return urls, nil
+}
+
+// uploadEyecatch は見出し画像を設定します。前回と同じ画像なら何もしません。
+func uploadEyecatch(client *note.Client, a *article.Article, rec *note.Posted, save func() error) error {
+	if a.Settings.Eyecatch == "" {
+		return nil
+	}
+	path := a.ImagePath(a.Settings.Eyecatch)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	hash := note.Hash(data)
+	if rec.Eyecatch == hash {
+		return nil
+	}
+	fmt.Printf("   見出し画像をアップロード中: %s\n", a.Settings.Eyecatch)
+	if err := client.UploadEyecatch(rec.ID, filepath.Base(path), data); err != nil {
+		return err
+	}
+	rec.Eyecatch = hash
+	return save()
 }

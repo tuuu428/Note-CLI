@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -39,6 +40,9 @@ type Settings struct {
 
 	// メンバーシップ限定公開にするプランのキー（実験的）。
 	MembershipPlans []string `yaml:"membership_plans"`
+
+	// 見出し画像（アイキャッチ）。記事ファイルからの相対パス。例: ./cover.png
+	Eyecatch string `yaml:"eyecatch"`
 
 	Comments *bool `yaml:"comments"` // コメントを受け付けるか
 	Notify   *bool `yaml:"notify"`   // フォロワーに通知するか
@@ -128,6 +132,9 @@ func merge(dst *Settings, own Settings) {
 	if own.MembershipPlans != nil {
 		dst.MembershipPlans = own.MembershipPlans
 	}
+	if own.Eyecatch != "" {
+		dst.Eyecatch = own.Eyecatch
+	}
 	if own.Comments != nil {
 		dst.Comments = own.Comments
 	}
@@ -186,10 +193,45 @@ func (a *Article) Validate() error {
 	case price == 0 && hasMarker:
 		errs = append(errs, "本文に <!-- paid --> がありますが price が 0 です（有料にするなら price を設定）")
 	}
+	errs = append(errs, a.checkImages()...)
 	if len(errs) > 0 {
 		return fmt.Errorf("%s:\n  - %s", a.Path, strings.Join(errs, "\n  - "))
 	}
 	return nil
+}
+
+// 画像として送れる形式（note のエディタが受け付けるもの）
+var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true}
+
+// ImagePath は本文やフロントマターに書いた画像の場所を、実際のファイルパスに直します。
+// 相対パスは記事ファイルがあるフォルダが基準です。"画像%201.png" のような URL 形式も読めます。
+func (a *Article) ImagePath(ref string) string {
+	if u, err := url.PathUnescape(ref); err == nil {
+		ref = u
+	}
+	if filepath.IsAbs(ref) {
+		return ref
+	}
+	return filepath.Join(filepath.Dir(a.Path), filepath.FromSlash(ref))
+}
+
+func (a *Article) checkImages() []string {
+	var errs []string
+	refs := ImageRefs(a.Body)
+	if a.Settings.Eyecatch != "" {
+		refs = append(refs, a.Settings.Eyecatch)
+	}
+	for _, ref := range refs {
+		p := a.ImagePath(ref)
+		if !imageExts[strings.ToLower(filepath.Ext(p))] {
+			errs = append(errs, fmt.Sprintf("画像 %s は対応していない形式です（png / jpg / gif / webp）", ref))
+			continue
+		}
+		if info, err := os.Stat(p); err != nil || info.IsDir() {
+			errs = append(errs, fmt.Sprintf("画像 %s が見つかりません（%s）", ref, p))
+		}
+	}
+	return errs
 }
 
 // Visibility は公開範囲を人間向けの日本語で説明します（確認表示用）。
@@ -208,6 +250,9 @@ func (s Settings) Visibility() string {
 	}
 	if len(s.Magazines) > 0 {
 		parts = append(parts, "マガジン: "+strings.Join(s.Magazines, ", "))
+	}
+	if s.Eyecatch != "" {
+		parts = append(parts, "見出し画像あり")
 	}
 	if !BoolOr(s.Comments, true) {
 		parts = append(parts, "コメント不可")

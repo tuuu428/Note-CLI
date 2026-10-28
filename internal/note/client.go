@@ -1,8 +1,10 @@
 // Package note は note.com とやり取り（HTTP 通信）する部分です。
 //
 // note には公式の公開 API がありません。ここではブラウザの note エディタが裏で使っている
-// 非公式の API を、先駆者の調査結果をもとに呼び出しています。note 側の変更で動かなく
-// なる可能性がある点に注意してください。
+// 非公式の API を、先駆者の調査結果をもとに呼び出しています。
+//
+// note 側の仕様が変わったときに「よく分からないまま投稿が進む」のを防ぐため、
+// 応答の形が想定と違ったら APIChangedError を返してその場で停止します（changed.go）。
 package note
 
 import (
@@ -10,8 +12,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -31,7 +36,7 @@ type Client struct {
 func NewClient(session string) *Client {
 	return &Client{
 		BaseURL: DefaultBaseURL,
-		HTTP:    &http.Client{Timeout: 30 * time.Second},
+		HTTP:    &http.Client{Timeout: 60 * time.Second},
 		Session: session,
 	}
 }
@@ -48,19 +53,21 @@ func (e *APIError) Error() string {
 	switch e.Status {
 	case 401, 403:
 		hint = "（ログインの有効期限切れかもしれません。`note-cli login` をやり直してください）"
-	case 404:
-		hint = "（note 側の API が変わった可能性があります）"
 	case 422:
 		hint = "（送った設定値を note が受け付けませんでした。`--dry-run` で中身を確認してください）"
 	}
-	body := e.Body
-	if len(body) > 300 {
-		body = body[:300] + "..."
-	}
-	return fmt.Sprintf("note API エラー %s %s: %d %s %s", e.Method, e.Path, e.Status, body, hint)
+	return fmt.Sprintf("note API エラー %s %s: %d %s %s", e.Method, e.Path, e.Status, shorten(e.Body), hint)
 }
 
-func (c *Client) do(method, path string, in, out any) error {
+func shorten(s string) string {
+	if len(s) > 300 {
+		return s[:300] + "..."
+	}
+	return s
+}
+
+// doJSON は JSON を送って JSON を受け取ります。
+func (c *Client) doJSON(method, path string, in, out any) error {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
@@ -69,6 +76,11 @@ func (c *Client) do(method, path string, in, out any) error {
 		}
 		body = bytes.NewReader(b)
 	}
+	return c.send(method, path, "application/json", body, out)
+}
+
+// send は note に 1 回リクエストを送ります。ログイン Cookie と XSRF トークンはここで付けます。
+func (c *Client) send(method, path, contentType string, body io.Reader, out any) error {
 	req, err := http.NewRequest(method, c.BaseURL+path, body)
 	if err != nil {
 		return err
@@ -81,7 +93,7 @@ func (c *Client) do(method, path string, in, out any) error {
 	}
 	req.Header.Set("Cookie", cookie)
 	if method != http.MethodGet {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
 		req.Header.Set("Origin", "https://editor.note.com")
 		req.Header.Set("Referer", "https://editor.note.com/")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -102,11 +114,16 @@ func (c *Client) do(method, path string, in, out any) error {
 		return err
 	}
 	if res.StatusCode >= 300 {
+		if changedStatus(res.StatusCode) {
+			return &APIChangedError{Endpoint: method + " " + path,
+				Detail: fmt.Sprintf("ステータス %d（窓口が無くなった・移動した可能性。記事を note 上で削除した場合もこうなります）: %s", res.StatusCode, shorten(string(raw)))}
+		}
 		return &APIError{Method: method, Path: path, Status: res.StatusCode, Body: string(raw)}
 	}
-	if out != nil && len(raw) > 0 {
+	if out != nil {
 		if err := json.Unmarshal(raw, out); err != nil {
-			return fmt.Errorf("note の応答を読めませんでした: %w", err)
+			return &APIChangedError{Endpoint: method + " " + path,
+				Detail: "応答が JSON ではありませんでした: " + shorten(string(raw))}
 		}
 	}
 	return nil
@@ -134,14 +151,18 @@ type User struct {
 
 // CurrentUser はログイン中のユーザー情報を取得します（XSRF トークンもここで受け取る）。
 func (c *Client) CurrentUser() (*User, error) {
+	const ep = "GET /api/v2/current_user"
 	var res struct {
 		Data *User `json:"data"`
 	}
-	if err := c.do(http.MethodGet, "/api/v2/current_user", nil, &res); err != nil {
+	if err := c.doJSON(http.MethodGet, "/api/v2/current_user", nil, &res); err != nil {
 		return nil, err
 	}
-	if res.Data == nil || res.Data.ID == 0 {
+	if res.Data == nil {
 		return nil, fmt.Errorf("ログインしていません（セッションが無効です）。`note-cli login` を実行してください")
+	}
+	if res.Data.ID == 0 || res.Data.URLName == "" {
+		return nil, &APIChangedError{Endpoint: ep, Detail: "data.id / data.urlname がありません"}
 	}
 	return res.Data, nil
 }
@@ -191,32 +212,147 @@ type Note struct {
 // CreateDraft は空の下書きを新しく作ります。
 func (c *Client) CreateDraft(userID int64, title string) (*Note, error) {
 	var res struct {
-		Data Note `json:"data"`
+		Data *Note `json:"data"`
 	}
 	in := map[string]any{"body": "<p></p>", "body_length": 0, "name": title, "index": false, "is_lead_form": false}
-	if err := c.do(http.MethodPost, fmt.Sprintf("/api/v1/text_notes?user_id=%d", userID), in, &res); err != nil {
+	path := fmt.Sprintf("/api/v1/text_notes?user_id=%d", userID)
+	if err := c.doJSON(http.MethodPost, path, in, &res); err != nil {
 		return nil, err
 	}
-	if res.Data.ID == 0 {
-		return nil, fmt.Errorf("下書きを作成できませんでした（ID が返ってきませんでした）")
+	if res.Data == nil || res.Data.ID == 0 || res.Data.Key == "" {
+		return nil, &APIChangedError{Endpoint: "POST /api/v1/text_notes", Detail: "作成した下書きの data.id / data.key が返ってきませんでした"}
 	}
-	if res.Data.Key == "" {
-		res.Data.Key = fmt.Sprintf("n%d", res.Data.ID)
-	}
-	return &res.Data, nil
+	return res.Data, nil
 }
 
 // SaveDraft は下書きのタイトルと本文を保存します。
 // ※ タグ・価格・マガジンなどは下書き保存では反映されず、公開時（Publish）にだけ反映されます。
 func (c *Client) SaveDraft(id int64, title, bodyHTML string, bodyLength int) error {
 	in := map[string]any{"body": bodyHTML, "body_length": bodyLength, "name": title, "index": false, "is_lead_form": false}
-	return c.do(http.MethodPost, fmt.Sprintf("/api/v1/text_notes/draft_save?id=%d&is_temp_saved=true", id), in, nil)
+	var res map[string]any
+	return c.doJSON(http.MethodPost, fmt.Sprintf("/api/v1/text_notes/draft_save?id=%d&is_temp_saved=true", id), in, &res)
 }
 
 // Publish は記事を公開します（公開済み記事の更新にも使います）。
 // note の API は「一部だけ更新」ができないので、payload にはすべての項目を入れて送ります。
 func (c *Client) Publish(id int64, payload map[string]any) error {
-	return c.do(http.MethodPut, fmt.Sprintf("/api/v1/text_notes/%d", id), payload, nil)
+	var res map[string]any
+	return c.doJSON(http.MethodPut, fmt.Sprintf("/api/v1/text_notes/%d", id), payload, &res)
+}
+
+// Published は公開後に note から読み直した記事の状態です。
+type Published struct {
+	Status string `json:"status"`
+	Price  *int   `json:"price"`
+}
+
+// GetNote は記事の現在の状態を取得します（公開できたかの確認に使う）。
+func (c *Client) GetNote(key string) (*Published, error) {
+	const ep = "GET /api/v3/notes/{key}"
+	var res struct {
+		Data *Published `json:"data"`
+	}
+	if err := c.doJSON(http.MethodGet, "/api/v3/notes/"+url.PathEscape(key), nil, &res); err != nil {
+		return nil, err
+	}
+	if res.Data == nil || res.Data.Status == "" || res.Data.Price == nil {
+		return nil, &APIChangedError{Endpoint: ep, Detail: "data.status / data.price がありません"}
+	}
+	return res.Data, nil
+}
+
+// ---- 画像 ----
+
+// UploadImage は本文用の画像をアップロードし、note 上の画像 URL を返します。
+//
+// 手順は 2 段階です（ブラウザの note エディタと同じ）:
+//  1. note に「アップロードしたい」と伝え、保存先（Amazon S3）への一時的な許可証をもらう
+//  2. その許可証を付けて、画像を S3 に直接送る
+func (c *Client) UploadImage(filename string, data []byte) (string, error) {
+	const ep = "POST /api/v3/images/upload/presigned_post"
+	body, ctype, err := multipartBody([][2]string{{"filename", filename}}, "", "", nil)
+	if err != nil {
+		return "", err
+	}
+	var res struct {
+		Data *struct {
+			URL    string         `json:"url"`
+			Action string         `json:"action"`
+			Post   map[string]any `json:"post"`
+		} `json:"data"`
+	}
+	if err := c.send(http.MethodPost, "/api/v3/images/upload/presigned_post", ctype, body, &res); err != nil {
+		return "", err
+	}
+	d := res.Data
+	if d == nil || d.URL == "" || d.Action == "" || len(d.Post) == 0 {
+		return "", &APIChangedError{Endpoint: ep, Detail: "data.url / data.action / data.post がありません"}
+	}
+
+	// S3 は「file 以外の項目を先、file を最後」に送る決まり
+	fields := make([][2]string, 0, len(d.Post))
+	for _, k := range sortedKeys(d.Post) {
+		if v := fmt.Sprint(d.Post[k]); d.Post[k] != nil && v != "" {
+			fields = append(fields, [2]string{k, v})
+		}
+	}
+	s3Body, s3Type, err := multipartBody(fields, "file", filename, data)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, d.Action, s3Body)
+	if err != nil {
+		return "", &APIChangedError{Endpoint: ep, Detail: "data.action が URL ではありません: " + d.Action}
+	}
+	req.Header.Set("Content-Type", s3Type)
+	s3Res, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer s3Res.Body.Close()
+	if s3Res.StatusCode >= 300 {
+		raw, _ := io.ReadAll(s3Res.Body)
+		return "", fmt.Errorf("画像の保存先（S3）へのアップロードに失敗しました: %d %s", s3Res.StatusCode, shorten(string(raw)))
+	}
+	return d.URL, nil
+}
+
+// UploadEyecatch は記事の見出し画像（アイキャッチ）を設定します。
+func (c *Client) UploadEyecatch(noteID int64, filename string, data []byte) error {
+	body, ctype, err := multipartBody([][2]string{{"note_id", fmt.Sprint(noteID)}}, "file", filename, data)
+	if err != nil {
+		return err
+	}
+	var res map[string]any
+	return c.send(http.MethodPost, "/api/v1/image_upload/note_eyecatch", ctype, body, &res)
+}
+
+// multipartBody はファイル送信用の「multipart/form-data」形式の中身を作ります。
+func multipartBody(fields [][2]string, fileField, filename string, data []byte) (io.Reader, string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for _, f := range fields {
+		if err := w.WriteField(f[0], f[1]); err != nil {
+			return nil, "", err
+		}
+	}
+	if fileField != "" {
+		h := textproto.MIMEHeader{}
+		safe := strings.NewReplacer(`"`, "", "\r", "", "\n", "").Replace(filename)
+		h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fileField, safe))
+		h.Set("Content-Type", http.DetectContentType(data))
+		part, err := w.CreatePart(h)
+		if err != nil {
+			return nil, "", err
+		}
+		if _, err := part.Write(data); err != nil {
+			return nil, "", err
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, "", err
+	}
+	return &buf, w.FormDataContentType(), nil
 }
 
 // NoteURL は記事の公開 URL を返します。

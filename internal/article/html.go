@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
+	"html"
 	"regexp"
 	"strings"
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
-	"github.com/yuin/goldmark/renderer/html"
+	gmhtml "github.com/yuin/goldmark/renderer/html"
 	"github.com/yuin/goldmark/text"
 )
 
@@ -39,7 +40,7 @@ type HTML struct {
 var md = goldmark.New(
 	goldmark.WithExtensions(extension.Strikethrough, extension.Linkify),
 	// 1 回の改行をそのまま改行（<br>）として扱う。テキストファイルの見た目どおりになる
-	goldmark.WithRendererOptions(html.WithHardWraps()),
+	goldmark.WithRendererOptions(gmhtml.WithHardWraps()),
 )
 
 var openTagRe = regexp.MustCompile(`^<([a-z0-9]+)`)
@@ -48,9 +49,13 @@ var openTagRe = regexp.MustCompile(`^<([a-z0-9]+)`)
 //
 // note のエディタは段落ごとに name と id（ランダムな ID）を持っています。
 // 有料ラインの位置もこの ID で指定するので、段落ごとに ID を振ります。
-func ToHTML(body string) (HTML, error) {
+//
+// images は「本文に書いた画像の場所 → アップロード後の URL」の対応表です。
+// 対応表に無いローカル画像は "upload://場所" という仮の URL になります（--dry-run 用）。
+func ToHTML(body string, images map[string]string) (HTML, error) {
 	src := []byte(body)
 	doc := md.Parser().Parse(text.NewReader(src))
+	replaceImageURLs(doc, images)
 
 	var out HTML
 	var full, free, paid strings.Builder
@@ -63,13 +68,18 @@ func ToHTML(body string) (HTML, error) {
 		}
 		normalizeHeading(n)
 
-		var buf bytes.Buffer
-		if err := md.Renderer().Render(&buf, src, n); err != nil {
-			return out, err
-		}
 		id := newID()
-		block := openTagRe.ReplaceAllString(strings.TrimSpace(buf.String()),
-			fmt.Sprintf(`<$1 name="%s" id="%s"`, id, id))
+		var block string
+		if img := soleImage(n); img != nil {
+			block = figure(id, img, src)
+		} else {
+			var buf bytes.Buffer
+			if err := md.Renderer().Render(&buf, src, n); err != nil {
+				return out, err
+			}
+			block = openTagRe.ReplaceAllString(strings.TrimSpace(buf.String()),
+				fmt.Sprintf(`<$1 name="%s" id="%s"`, id, id))
+		}
 
 		full.WriteString(block)
 		if inPaid {
@@ -86,6 +96,66 @@ func ToHTML(body string) (HTML, error) {
 	}
 	out.Length = len([]rune(stripTags(out.Full)))
 	return out, nil
+}
+
+// ImageRefs は本文中のローカル画像（http で始まらないもの）の場所を、登場順・重複なしで返します。
+func ImageRefs(body string) []string {
+	src := []byte(body)
+	doc := md.Parser().Parse(text.NewReader(src))
+	var refs []string
+	seen := map[string]bool{}
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if img, ok := n.(*ast.Image); ok && entering {
+			dest := string(img.Destination)
+			if isLocal(dest) && !seen[dest] {
+				seen[dest] = true
+				refs = append(refs, dest)
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	return refs
+}
+
+func isLocal(dest string) bool {
+	return !strings.HasPrefix(dest, "http://") && !strings.HasPrefix(dest, "https://") && !strings.HasPrefix(dest, "data:")
+}
+
+func replaceImageURLs(doc ast.Node, images map[string]string) {
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if img, ok := n.(*ast.Image); ok && entering {
+			dest := string(img.Destination)
+			if !isLocal(dest) {
+				return ast.WalkContinue, nil
+			}
+			if u, ok := images[dest]; ok {
+				img.Destination = []byte(u)
+			} else {
+				img.Destination = []byte("upload://" + dest)
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+}
+
+// soleImage は「画像だけの段落」なら、その画像を返します。
+func soleImage(n ast.Node) *ast.Image {
+	if n.Kind() != ast.KindParagraph || n.ChildCount() != 1 {
+		return nil
+	}
+	img, _ := n.FirstChild().(*ast.Image)
+	return img
+}
+
+// figure は note の画像ブロックの形にします。![キャプション](画像) のキャプション部分は画像の下に表示されます。
+func figure(id string, img *ast.Image, src []byte) string {
+	caption := html.EscapeString(string(img.Text(src)))
+	s := fmt.Sprintf(`<figure name="%s" id="%s"><img src="%s" alt="" width="620" height="auto">`,
+		id, id, html.EscapeString(string(img.Destination)))
+	if caption != "" {
+		s += "<figcaption>" + caption + "</figcaption>"
+	}
+	return s + "</figure>"
 }
 
 func isPaidMarker(n ast.Node, src []byte) bool {
@@ -125,11 +195,4 @@ func newID() string {
 	b[6] = b[6]&0x0f | 0x40
 	b[8] = b[8]&0x3f | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
-}
-
-var localImageRe = regexp.MustCompile(`!\[[^\]]*\]\((?:\./|\.\./|/)?[^):]+\)`)
-
-// LocalImages は本文中のローカル画像参照（未対応）を返します。警告表示に使います。
-func LocalImages(body string) []string {
-	return localImageRe.FindAllString(body, -1)
 }

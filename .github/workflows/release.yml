@@ -1,0 +1,27 @@
+# v0.1.0 のようなタグを push すると、Windows / Mac / Linux 用の完成品を作って
+# GitHub の「Releases」ページに自動で公開する
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # Releases ページに書き込むため
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 変更履歴（changelog）を作るために全履歴を取得
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

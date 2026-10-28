@@ -7,8 +7,11 @@ import (
 	"github.com/tuuu428/note-cli/cmd"
 )
 
+// version は `go build -ldflags "-X main.version=v1.2.3"` で上書きされます（GoReleaser が自動で行う）。
+var version = "dev"
+
 func main() {
-	if err := cmd.Execute(); err != nil {
+	if err := cmd.Execute(version); err != nil {
 		os.Exit(1)
 	}
 }

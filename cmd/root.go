@@ -17,7 +17,8 @@ var rootCmd = &cobra.Command{
 	SilenceUsage: true,
 }
 
-// Execute は main から呼ばれる入口です。
-func Execute() error {
+// Execute は main から呼ばれる入口です。version は GoReleaser が完成品を作るときに埋め込みます。
+func Execute(version string) error {
+	rootCmd.Version = version
 	return rootCmd.Execute()
 }

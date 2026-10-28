@@ -13,6 +13,20 @@
 
 ## インストール
 
+### 完成品をダウンロード（Go 不要）
+
+[Releases](https://github.com/tuuu428/note-cli/releases) ページから自分の PC に合うファイルをダウンロードして解凍します。
+
+| PC | ファイル |
+|---|---|
+| Windows | `note-cli_..._windows_amd64.zip` |
+| Mac（M1 以降） | `note-cli_..._darwin_arm64.tar.gz` |
+| Mac（Intel） | `note-cli_..._darwin_amd64.tar.gz` |
+
+※ Mac で「開発元を確認できない」と出たら、ターミナルで `xattr -d com.apple.quarantine note-cli` を実行してください。
+
+### Go から入れる
+
 [Go](https://go.dev/dl/) を入れたあと:
 
 ```sh
@@ -60,6 +74,23 @@ notify: true         # フォロワーに通知する
 ## 見出し
 ```
 
+### 画像
+
+```markdown
+---
+title: 画像つき記事
+eyecatch: images/cover.png     # 見出し画像
+---
+
+![キャプション（画像の下の説明文）](images/figure.png)
+```
+
+- 記事ファイルからの相対パスで指定します（png / jpg / gif / webp）
+- 画像だけの行は note の画像ブロックになり、`![ ]` の中の文字がキャプションになります
+- 自分で用意した画像も、手元の AI で生成した画像も、フォルダに保存すれば同じように使えます
+- 一度アップロードした画像は記録され、**中身が変わらない限り再アップロードしません**
+- ファイル名に空白がある場合は `![](<images/my photo.png>)` のように `< >` で囲みます
+
 フロントマター（先頭の `---` で囲んだ部分）が無い `.txt` ファイルは、**1 行目がタイトル**、残りが本文になり、下書き扱いです。
 
 ### 3. チェックして投稿
@@ -88,6 +119,7 @@ note-cli post 記事.md --publish        # 設定に関係なく公開
 | `refund` | `true` | 有料記事の返金を許可するか |
 | `magazines` | `[m1234abcd]` | 追加するマガジン（URL の `/m/` の後ろのキー、または数値 ID） |
 | `membership_plans` | `[プランキー]` | メンバーシップ限定公開（**実験的**） |
+| `eyecatch` | `images/cover.png` | 見出し画像 |
 | `comments` | `false` | コメントを受け付けない |
 | `notify` | `false` | フォロワーに通知しない |
 | `extra` | `{index: true}` | note の API に直接送る追加項目（上級者向け） |
@@ -125,15 +157,50 @@ magazines: [m1234abcd]
 
 ## できないこと・既知の制限
 
-- **画像**: 本文中のローカル画像（`![](./img.png)`）はアップロードしません（警告を表示します）。投稿後に note の編集画面で追加してください
 - **公開済み → 下書き** に戻す操作はできません（note の画面で操作してください）
-- **予約投稿**・**メンバーシップ限定**は API 仕様の確認が不十分です。動かない場合は `--dry-run` で中身を見て、`extra:` で項目を調整してください
+- **予約投稿**は未対応です（調べ方は [docs/LEARNING.md](docs/LEARNING.md#13-予約投稿の調べ方) に）
+- **メンバーシップ限定**・**見出し画像**は API 仕様の確認が不十分です。動かない場合は `--dry-run` で中身を見て、`extra:` で項目を調整してください
 - タグ・価格・マガジンなどの設定は**公開時にだけ**反映されます（note の下書き保存 API はこれらを無視するため）
+
+## note の仕様が変わったら（自動停止）
+
+非公式 API は予告なく変わります。このツールは、note の応答が想定と違ったら**その場で停止**し、残りの記事も投稿しません。
+
+- 窓口が無くなった（404 など）、応答が JSON でない、必要な項目が無い → 停止
+- 公開後に記事を読み直し、**公開状態と価格が送ったとおりか確認**。違えば停止（「有料のつもりが無料で公開」などに気づける）
+
+```
+note の API 仕様が変わった可能性があるため、処理を停止しました。
+  窓口: PUT /api/v1/text_notes/{id}
+  内容: 送った設定が反映されていません（期待: status=published price=300 / 実際: ...）
+```
+
+止まったら note の画面で記事の状態を確認してください。`note-cli doctor` で、投稿せずに API の状態だけ確認できます。
+
+```sh
+note-cli doctor              # ログインとユーザー情報の取得を確認
+note-cli doctor 記事フォルダ/  # ↑に加えて、公開済み記事の読み直しも確認
+```
+
+## 自動化（GitHub Actions）
+
+| ワークフロー | いつ動く | 何をする |
+|---|---|---|
+| `ci.yml` | push / プルリクエスト | テストと設定チェック |
+| `release.yml` | `v0.1.0` などのタグを push | Windows / Mac / Linux 用の完成品を作って Releases に公開 |
+| `api-check.yml` | 毎週月曜 | `doctor` で note の API を確認（`NOTE_SESSION` シークレット登録時のみ） |
+
+リリースの出し方:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## 参考にした先駆者の情報
 
 - [JY8752/note-cli](https://github.com/JY8752/note-cli) — Go + Cobra で作られた note 用 CLI（記事ファイル・画像の作成）
-- [shimayuz/note-com-mcp](https://github.com/shimayuz/note-com-mcp) — 非公式 API での下書き作成・保存（`/api/v1/text_notes`、`draft_save`）、認証（Cookie + XSRF トークン）の実装
+- [shimayuz/note-com-mcp](https://github.com/shimayuz/note-com-mcp) — 非公式 API での下書き作成・保存（`/api/v1/text_notes`、`draft_save`）、認証（Cookie + XSRF トークン）、画像アップロード（`presigned_post` → S3、`note_eyecatch`）の実装
 - [Go-555/note-post-mcp](https://github.com/Go-555/note-post-mcp) — ブラウザ自動操作（Playwright）による投稿
 - [A Thorough Investigation of the Unofficial note API](https://note.com/marie_222/n/n6a10366298b0?hl=en) — 公開 API（`PUT /api/v1/text_notes/{id}`）の項目（`hashtags` / `price` / `free_body` / `pay_body` / `separator` / `magazine_ids`）の調査
 - [AIエージェントがNote自動投稿を実装するまで：非公式APIとの奮闘記](https://note.com/a_g_e_n_t_b_o_t/n/n86da8314430b) — タグ・価格は公開時の PUT でのみ受け付けられる、という知見
@@ -144,4 +211,5 @@ magazines: [m1234abcd]
 ```sh
 go test ./...   # テスト（本物の note には接続しません）
 go vet ./...
+goreleaser release --snapshot --clean   # 完成品を手元で試しに作る（dist/ にできる）
 ```

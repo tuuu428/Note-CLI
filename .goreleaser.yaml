@@ -1,0 +1,39 @@
+# GoReleaser の設定: Windows / Mac / Linux 用の完成品（実行ファイル）をまとめて作る
+# 手元で試す:  goreleaser release --snapshot --clean   → dist/ フォルダにできる
+# 本番:        git tag v0.1.0 && git push origin v0.1.0 → GitHub Actions が自動で作って公開
+version: 2
+
+project_name: note-cli
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - binary: note-cli
+    env:
+      - CGO_ENABLED=0 # C 言語の部品を使わない = どの PC でもそのまま動く
+    goos: [windows, darwin, linux]
+    goarch: [amd64, arm64] # amd64 = Intel/AMD の PC, arm64 = M1 以降の Mac など
+    ldflags:
+      - -s -w -X main.version={{.Version}} # `note-cli --version` にバージョンを埋め込む
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip] # Windows では zip が開きやすい
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - docs/*
+      - examples/*
+
+checksum:
+  name_template: checksums.txt # ダウンロードしたファイルが壊れていないか確認する指紋
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:"]
